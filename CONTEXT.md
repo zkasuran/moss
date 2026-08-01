@@ -26,12 +26,27 @@ _Avoid_: view, getter
 An ABI-typed gateway to one contract that can encode an unsigned transaction, read state, or preview a write without sending it.
 _Avoid_: contract instance, client
 
+**Protocol binding**:
+The inputs identifying one instance of a parameterized Protocol, declared once in a binding schema rather than repeated in every method's parameters. Validation is synchronous and reads nothing external, so a malformed binding fails before any Protocol method and before any RPC.
+_Avoid_: constructor argument, config, method parameter
+
+**Binding schema**:
+A parameterized Protocol's declaration of its binding: parameter declarations plus a synchronous function deriving that instance's contract configs. The TypeScript binding type is derived from the same schema, so the runtime and compile-time contracts cannot drift.
+
+**Bound Protocol**:
+An execution-scoped Protocol instance created from one validated binding, with its dynamic Handles assembled at construction. Bound Protocols are never cached, so two instances of the same Protocol never share state.
+_Avoid_: singleton, bound service
+
+**Protocol factory**:
+The non-callable object Registry injects for a declared parameterized dependency. Its `create` returns an independent Bound Protocol reference; its separate `receipts` surface exposes only that Protocol's pure parsers, carrying no Runtime, account, Handles or binding. A parameterized package exports the ready-to-use factory alias its consumers declare.
+_Avoid_: service locator, provider, container
+
 **Capability tree**:
 The sole executable structure for a write: an ordered tree of CapabilityNode composition nodes and TransactionNode leaves. There is no independent transaction list. Core validates it against one fail-closed complexity contract before execution and rejects cycles and shared nodes; the structure must remain a bounded tree.
 _Avoid_: Plan, transaction bundle
 
 **CapabilityNode**:
-A serializable node identifying one Capability by protocol + method, with its canonical parameters and ordered children. Registry resolves its Receipt parser from the registered Capability metadata. Exactly one child is its direct TransactionNode; the others are nested CapabilityNodes.
+A serializable node identifying one Capability by protocol + method, with its canonical binding when the Protocol is parameterized, its canonical parameters and ordered children. Registry resolves its Receipt parser from the registered Capability metadata. Exactly one child is its direct TransactionNode; the others are nested CapabilityNodes.
 
 **TransactionNode**:
 A Capability-tree leaf containing one unsigned transaction. A contract-level multicall is still one TransactionNode.

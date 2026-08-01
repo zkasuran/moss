@@ -50,6 +50,9 @@ const capabilityNodeSchema: z.ZodType<CapabilityNode> = z.lazy(() =>
       kind: z.literal("capability"),
       protocol: z.string().min(1),
       method: z.string().min(1),
+      // Present only for a parameterized Protocol. Registry re-checks it
+      // against the Protocol the node names before Simulator runs.
+      binding: jsonValueSchema.optional(),
       params: jsonValueSchema,
       children: z.array(z.union([capabilityNodeSchema, transactionSchema])),
     })

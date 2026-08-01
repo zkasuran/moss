@@ -67,6 +67,37 @@ export async function parseParams<S extends ParamsSpec>(
   return result.data as InferParams<S>;
 }
 
+/**
+ * Validates one Protocol binding against its declared schema.
+ *
+ * Binding decides which contract a Bound Protocol points at, so it is settled
+ * before anything is constructed and without touching the chain. That is why
+ * this parses synchronously rather than reusing `parseParams`: Zod's
+ * synchronous parse throws on a schema that needs to await, so an async
+ * refinement (the shape a hidden RPC or other external read would take) is
+ * rejected as a malformed schema instead of running.
+ */
+export function parseBinding<S extends ParamsSpec>(
+  spec: S,
+  raw: Record<string, unknown>,
+): InferParams<S> {
+  const schema = z
+    .object(Object.fromEntries(Object.entries(spec).map(([name, field]) => [name, field.type])))
+    .strict();
+  let result: z.ZodSafeParseResult<Record<string, unknown>>;
+  try {
+    result = schema.safeParse(raw);
+  } catch (error) {
+    throw new ParameterError(
+      `binding must validate synchronously: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!result.success) {
+    throw new ParameterError(z.prettifyError(result.error));
+  }
+  return result.data as InferParams<S>;
+}
+
 export function describeParams(
   spec: ParamsSpec,
 ): Record<string, { type: JsonSafeValue; description: string }> {

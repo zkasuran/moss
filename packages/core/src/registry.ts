@@ -1,5 +1,7 @@
 import { isAddress } from "viem";
 import {
+  type BindingSchema,
+  type ContractConfig,
   METHOD_META,
   type MethodMeta,
   PROTOCOL_META,
@@ -12,7 +14,13 @@ import {
 import { flattenCapabilityTree, toJsonSafe, verifyReceiptCoverage } from "./framework.js";
 import { queryObservationOf, type TokenMetadataObservation } from "./observations.js";
 import type { MossRuntime } from "./runtime.js";
-import { describeParams, parameterTypeDescription, parseParams } from "./semantics.js";
+import {
+  describeParams,
+  type ParameterDeclaration,
+  parameterTypeDescription,
+  parseBinding,
+  parseParams,
+} from "./semantics.js";
 import type {
   Address,
   CapabilityNode,
@@ -32,6 +40,41 @@ import { CATEGORIES, RISK_LABELS, VERBS } from "./types.js";
 
 export interface ActionCtx {
   account: Address;
+}
+
+/**
+ * One validated Protocol instance identity: the canonical binding that will be
+ * serialized onto the CapabilityNode, and the contract configs that binding
+ * derived. Both are produced once, by `Registry.#bind`, before any Protocol
+ * code runs.
+ */
+interface BoundIdentity {
+  readonly binding: JsonSafeValue;
+  readonly contracts: Record<string, ContractConfig>;
+}
+
+/**
+ * Defines the names one injected surface cannot serve, so the mistake reports
+ * itself instead of answering `undefined`. A declared field type can be wrong
+ * in a way TypeScript cannot catch, because neither a decorator nor a binding
+ * is visible to it: an unbound dependency declared as a factory, a
+ * parameterized one declared as a plain reference, or a pure parser reached
+ * through a Bound Protocol. Registry keeps the last word at the call site.
+ */
+function defineUnavailable(
+  surface: Record<string, unknown>,
+  keys: Iterable<string>,
+  message: (key: string) => string,
+): void {
+  for (const key of keys) {
+    if (Object.hasOwn(surface, key)) continue;
+    Object.defineProperty(surface, key, {
+      enumerable: false,
+      get() {
+        throw new Error(message(key));
+      },
+    });
+  }
 }
 
 export interface Coordinate {
@@ -58,6 +101,11 @@ export interface Stub {
   category: Category;
   risk: RiskLabel[];
   tags: string[];
+  /**
+   * Inputs identifying the Protocol instance, declared separately from the
+   * operation's own inputs. Absent for an unbound Protocol.
+   */
+  binding?: Record<string, LoadedParameter>;
   params: Record<string, LoadedParameter>;
 }
 
@@ -74,6 +122,8 @@ interface Registered {
   config: ProtocolConfig<ProtocolDependencies>;
   methods: Record<string, MethodMeta>;
   receipts: Set<string>;
+  /** Present when the Protocol is parameterized; absent when it is unbound. */
+  binding?: BindingSchema;
   packageName: string;
   packageLabels: ReadonlyMap<string, string>;
 }
@@ -93,6 +143,27 @@ function configOf(value: unknown): ProtocolConfig<ProtocolDependencies> | undefi
 function requireMetadataText(value: unknown, path: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+/**
+ * Holds every parameter declaration to the same contract, whether it identifies
+ * the Protocol instance or the operation: a reusable value type carrying its
+ * own description, plus a separate description of this field's purpose.
+ */
+function requireParameterMetadata(
+  params: Record<string, ParameterDeclaration>,
+  path: string,
+): void {
+  for (const [param, field] of Object.entries(params)) {
+    requireMetadataText(field?.description, `parameter "${path}.${param}" description`);
+    if (!field.type || typeof field.type.safeParseAsync !== "function") {
+      throw new Error(`parameter "${path}.${param}" has an invalid type`);
+    }
+    requireMetadataText(
+      parameterTypeDescription(field.type),
+      `parameter "${path}.${param}" type description`,
+    );
   }
 }
 
@@ -138,6 +209,10 @@ function titleCaseSlug(slug: string): string {
     .split("-")
     .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
     .join(" ");
+}
+
+function isBindingObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasProtocol(receipt: ReceiptResult): receipt is Receipt {
@@ -242,6 +317,9 @@ export class Registry {
       `protocol "${config.name}"`,
       packageName,
     );
+    if (config.binding) {
+      requireParameterMetadata(config.binding.params, `${config.name}.binding`);
+    }
     for (const dependency of Object.values(config.protocols ?? {})) {
       this.register(dependency, [...stack, config.name]);
     }
@@ -274,19 +352,7 @@ export class Registry {
       if (meta.spec.tags?.some((tag) => typeof tag !== "string" || tag.trim().length === 0)) {
         throw new Error(`method "${config.name}.${name}" has an invalid tag`);
       }
-      for (const [param, field] of Object.entries(meta.spec.params)) {
-        requireMetadataText(
-          field.description,
-          `parameter "${config.name}.${name}.${param}" description`,
-        );
-        if (!field.type || typeof field.type.safeParseAsync !== "function") {
-          throw new Error(`parameter "${config.name}.${name}.${param}" has an invalid type`);
-        }
-        requireMetadataText(
-          parameterTypeDescription(field.type),
-          `parameter "${config.name}.${name}.${param}" type description`,
-        );
-      }
+      requireParameterMetadata(meta.spec.params, `${config.name}.${name}`);
       if (meta.kind !== "capability") continue;
       if (!VERBS.includes(meta.spec.verb)) {
         throw new Error(`capability "${config.name}.${name}" has an invalid verb`);
@@ -311,6 +377,7 @@ export class Registry {
       config,
       methods,
       receipts,
+      ...(config.binding ? { binding: config.binding } : {}),
       packageName,
       packageLabels,
     });
@@ -352,28 +419,39 @@ export class Registry {
         category: registered.config.category,
         risk: meta.kind === "capability" ? meta.spec.risk : [],
         tags: meta.spec.tags ?? [],
+        ...(registered.binding ? { binding: describeParams(registered.binding.params) } : {}),
         params: describeParams(meta.spec.params),
       };
     });
   }
 
+  /**
+   * Runs a Query or builds a Capability tree. `binding` identifies the Protocol
+   * instance and stays separate from the operation's own params, matching what
+   * `load` describes: a parameterized Protocol requires one and an unbound
+   * Protocol refuses one.
+   */
   async action(
     protocol: string,
     method: string,
     account: Address,
     rawParams: Record<string, unknown>,
+    rawBinding?: Record<string, unknown>,
   ): Promise<QueryResult | CapabilityNode> {
     const meta = this.#get(protocol).methods[method];
     if (!meta) throw new Error(`protocol "${protocol}" has no method "${method}"`);
+    // Binding decides which contract the instance points at, so it is settled
+    // before any Protocol code runs and before any RPC could be issued.
+    const bound = this.#resolveBinding(protocol, rawBinding);
     if (meta.kind === "query") {
       return {
         kind: "query",
         protocol,
         method,
-        data: await this.#runQuery(protocol, method, account, rawParams),
+        data: await this.#runQuery(protocol, method, account, rawParams, bound),
       };
     }
-    return this.#buildCapability(protocol, method, account, rawParams);
+    return this.#buildCapability(protocol, method, account, rawParams, bound);
   }
 
   parseReceipt(node: CapabilityNode, changes: readonly Change[]): Receipt {
@@ -385,7 +463,85 @@ export class Registry {
   validateCapabilityTree(root: CapabilityNode): void {
     for (const { capability } of flattenCapabilityTree(root)) {
       this.#capabilityMeta(capability.protocol, capability.method);
+      this.#requireDeclaredBinding(capability);
     }
+  }
+
+  /**
+   * Fails a wire-supplied node whose binding contradicts the Protocol it names,
+   * before simulation. A parameterized Protocol must carry a binding that still
+   * validates against its schema; an unbound one must carry none.
+   */
+  #requireDeclaredBinding(node: CapabilityNode): void {
+    const schema = this.#get(node.protocol).binding;
+    const coordinate = `capability "${node.protocol}.${node.method}"`;
+    if (!schema) {
+      if (node.binding !== undefined) {
+        throw new Error(
+          `${coordinate} carries a binding, but "${node.protocol}" is not parameterized`,
+        );
+      }
+      return;
+    }
+    if (!isBindingObject(node.binding)) {
+      throw new Error(`${coordinate} is missing the binding that "${node.protocol}" requires`);
+    }
+    parseBinding(schema.params, node.binding);
+  }
+
+  /**
+   * Validates one binding and derives the Handles it names. Synchronous
+   * throughout: the schema is parsed with Zod's synchronous parse and the
+   * derivation is a plain call, so a malformed binding fails here, before any
+   * Protocol method or RPC.
+   */
+  #bind(protocol: string, raw: Record<string, unknown>): BoundIdentity {
+    const schema = this.#get(protocol).binding;
+    if (!schema) throw new Error(`protocol "${protocol}" is not parameterized`);
+    const binding = parseBinding(schema.params, raw);
+    const derived: unknown = schema.contracts(binding);
+    if (
+      !derived ||
+      typeof derived !== "object" ||
+      Array.isArray(derived) ||
+      typeof (derived as { then?: unknown }).then === "function"
+    ) {
+      throw new Error(
+        `protocol "${protocol}" binding must derive contracts synchronously as a plain object`,
+      );
+    }
+    const entries = Object.entries(derived as Record<string, ContractConfig>);
+    if (entries.length === 0) {
+      throw new Error(`protocol "${protocol}" binding derived no contracts`);
+    }
+    for (const [key, contract] of entries) {
+      if (!contract || !Array.isArray(contract.abi)) {
+        throw new Error(`protocol "${protocol}" binding derived contract "${key}" without an ABI`);
+      }
+      if (!isAddress(contract.addr, { strict: false })) {
+        throw new Error(
+          `protocol "${protocol}" binding derived contract "${key}" with an invalid address`,
+        );
+      }
+    }
+    return { binding: toJsonSafe(binding), contracts: Object.fromEntries(entries) };
+  }
+
+  /** Resolves the optional binding an `action` supplied against the Protocol. */
+  #resolveBinding(
+    protocol: string,
+    raw: Record<string, unknown> | undefined,
+  ): BoundIdentity | undefined {
+    if (!this.#get(protocol).binding) {
+      if (raw !== undefined) {
+        throw new Error(`protocol "${protocol}" is not parameterized and accepts no binding`);
+      }
+      return undefined;
+    }
+    if (raw === undefined) {
+      throw new Error(`protocol "${protocol}" is parameterized and requires a binding`);
+    }
+    return this.#bind(protocol, raw);
   }
 
   async #buildCapability(
@@ -393,6 +549,7 @@ export class Registry {
     method: string,
     account: Address,
     rawParams: Record<string, unknown>,
+    bound?: BoundIdentity,
   ): Promise<CapabilityNode> {
     const registered = this.#get(protocol);
     const meta = registered.methods[method];
@@ -400,7 +557,7 @@ export class Registry {
       throw new Error(`"${protocol}.${method}" is not a Capability`);
     }
     const params = await parseParams(meta.spec.params, rawParams);
-    const instance = this.#instantiate(protocol, account);
+    const instance = this.#instantiate(protocol, account, bound);
     // biome-ignore lint/suspicious/noExplicitAny: metadata validates dynamic method dispatch
     const result = (await (instance as any)[method](params, { account } satisfies ActionCtx)) as
       | CapabilityResult
@@ -410,6 +567,7 @@ export class Registry {
       kind: "capability",
       protocol,
       method,
+      ...(bound ? { binding: bound.binding } : {}),
       params: toJsonSafe(params),
       children,
     };
@@ -422,12 +580,13 @@ export class Registry {
     method: string,
     account: Address,
     rawParams: Record<string, unknown>,
+    bound?: BoundIdentity,
   ): Promise<JsonSafeValue> {
     const registered = this.#get(protocol);
     const meta = registered.methods[method];
     if (meta?.kind !== "query") throw new Error(`"${protocol}.${method}" is not a Query`);
     const params = await parseParams(meta.spec.params, rawParams);
-    const instance = this.#instantiate(protocol, account);
+    const instance = this.#instantiate(protocol, account, bound);
     // biome-ignore lint/suspicious/noExplicitAny: metadata validates dynamic method dispatch
     const result = await (instance as any)[method](params, { account } satisfies ActionCtx);
     this.#processQueryObservation(result);
@@ -536,8 +695,15 @@ export class Registry {
     return instance;
   }
 
-  #instantiate(protocol: string, account: Address): object {
+  #instantiate(protocol: string, account: Address, bound?: BoundIdentity): object {
     const registered = this.#get(protocol);
+    if (!registered.binding !== !bound) {
+      throw new Error(
+        registered.binding
+          ? `protocol "${protocol}" is parameterized and requires a binding`
+          : `protocol "${protocol}" is not parameterized and accepts no binding`,
+      );
+    }
     const dependencies = Object.fromEntries(
       Object.entries(registered.config.protocols ?? {}).map(([key, dependency]) => {
         const name = configOf(dependency)?.name;
@@ -549,12 +715,14 @@ export class Registry {
       runtime: MossRuntime,
       account: Address,
       dependencies: Record<string, object>,
+      boundContracts?: Record<string, ContractConfig>,
     ) => object;
-    return new Ctor(this.runtime, account, dependencies);
+    return new Ctor(this.runtime, account, dependencies, bound?.contracts);
   }
 
   #dependency(protocol: string, account: Address): object {
     const registered = this.#get(protocol);
+    if (registered.binding) return this.#factory(protocol, account);
     const dependency: Record<string, unknown> = {};
     for (const [method, meta] of Object.entries(registered.methods)) {
       dependency[method] =
@@ -567,16 +735,105 @@ export class Registry {
       dependency[receipt] = (changes: readonly Change[]) =>
         this.#runReceipt(protocol, receipt, changes);
     }
+    defineUnavailable(
+      dependency,
+      ["create", "receipts"],
+      (key) =>
+        `protocol "${protocol}" is not parameterized, so it has no "${key}"; call its Capabilities, Queries and Receipt parsers directly`,
+    );
     return Object.freeze(dependency);
   }
 
-  #receiptDependency(protocol: string): object {
-    const dependency: Record<string, unknown> = {};
+  /**
+   * The non-callable surface injected for a parameterized dependency. `create`
+   * validates one binding and returns an independent reference; nothing is
+   * cached, so two calls carrying the same address produce two instances that
+   * cannot share state. `receipts` is the binding-free parser surface.
+   */
+  #factory(protocol: string, account: Address): object {
+    const registered = this.#get(protocol);
+    const factory: Record<string, unknown> = {
+      create: (binding: Record<string, unknown>) =>
+        this.#boundRef(protocol, account, this.#bind(protocol, binding ?? {})),
+      receipts: this.#receiptSurface(protocol),
+    };
+    defineUnavailable(
+      factory,
+      [...Object.keys(registered.methods), ...registered.receipts],
+      (key) =>
+        `protocol "${protocol}" is parameterized, so "${key}" is not on its factory; reach a Capability or Query through "create(binding)" and a Receipt parser through "receipts"`,
+    );
+    return Object.freeze(factory);
+  }
+
+  /**
+   * One Bound Protocol's operation surface. Every call carries the binding this
+   * reference was created with, so Registry stamps the resulting CapabilityNode
+   * with it and constructs the Handles it derived.
+   */
+  #boundRef(protocol: string, account: Address, bound: BoundIdentity): object {
+    const registered = this.#get(protocol);
+    const ref: Record<string, unknown> = {};
+    for (const [method, meta] of Object.entries(registered.methods)) {
+      ref[method] =
+        meta.kind === "capability"
+          ? (params: Record<string, unknown>) =>
+              this.#buildCapability(protocol, method, account, params, bound)
+          : (params: Record<string, unknown>) =>
+              this.#runQuery(protocol, method, account, params, bound);
+    }
+    defineUnavailable(
+      ref,
+      registered.receipts,
+      (key) =>
+        `protocol "${protocol}" Receipt parser "${key}" is not on a Bound Protocol; a parser is pure and binding-free, so reach it through the factory's "receipts" surface`,
+    );
+    return Object.freeze(ref);
+  }
+
+  #parserSurface(protocol: string): Record<string, unknown> {
+    const surface: Record<string, unknown> = {};
     for (const receipt of this.#get(protocol).receipts) {
-      dependency[receipt] = (changes: readonly Change[]) =>
+      surface[receipt] = (changes: readonly Change[]) =>
         this.#runReceipt(protocol, receipt, changes);
     }
-    return Object.freeze(dependency);
+    return surface;
+  }
+
+  /** A factory's `receipts`: pure parsers only, with no Runtime, account, Handles or binding. */
+  #receiptSurface(protocol: string): object {
+    const surface = this.#parserSurface(protocol);
+    defineUnavailable(
+      surface,
+      Object.keys(this.#get(protocol).methods),
+      (key) =>
+        `protocol "${protocol}" exposes only pure Receipt parsers through "receipts"; "${key}" is a Capability or Query`,
+    );
+    return Object.freeze(surface);
+  }
+
+  #receiptDependency(protocol: string): object {
+    const registered = this.#get(protocol);
+    if (registered.binding) {
+      // Declared as a factory, so a caller parser delegates through `receipts`.
+      // `create` needs a Runtime and an account, which a pure parser never has.
+      const factory: Record<string, unknown> = { receipts: this.#receiptSurface(protocol) };
+      defineUnavailable(
+        factory,
+        ["create", ...Object.keys(registered.methods), ...registered.receipts],
+        (key) =>
+          `protocol "${protocol}" cannot serve "${key}" to a Receipt parser; a parser is pure, so only the binding-free "receipts" surface is available`,
+      );
+      return Object.freeze(factory);
+    }
+    const surface = this.#parserSurface(protocol);
+    defineUnavailable(
+      surface,
+      ["create", "receipts", ...Object.keys(registered.methods)],
+      (key) =>
+        `protocol "${protocol}" cannot serve "${key}" to a Receipt parser; a parser is pure and reaches only this Protocol's Receipt parsers`,
+    );
+    return Object.freeze(surface);
   }
 
   #capabilityMeta(protocol: string, method: string): CapabilityMethodMeta {

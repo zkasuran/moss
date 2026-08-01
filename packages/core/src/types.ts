@@ -72,6 +72,13 @@ export interface CapabilityNode {
   kind: "capability";
   protocol: string;
   method: string;
+  /**
+   * Canonical binding of the parameterized Protocol that produced this node.
+   * Absent for an unbound Protocol, which has no identity to carry. Receipt
+   * parsing never receives or trusts it: it is serialized so an SDK consumer
+   * can see which instance acted, not so a parser can read evidence from it.
+   */
+  binding?: JsonSafeValue;
   params: JsonSafeValue;
   children: readonly (CapabilityNode | TransactionNode)[];
 }
@@ -91,6 +98,41 @@ export type ProtocolRef<T> = {
       : Result extends ReceiptResult<infer Outcome>
         ? (params: Params, ...args: _Rest) => Receipt<Outcome>
         : (params: Params) => Promise<Awaited<Result>>
+    : never;
+};
+
+/**
+ * One Bound Protocol's operation surface, returned by a factory's `create`.
+ * Capabilities nest into the caller's tree and Queries return ordinary data,
+ * exactly as for an unbound dependency.
+ *
+ * Receipt parsers are deliberately absent. A parser is pure and binding-free,
+ * so it lives on the factory's own `receipts` surface instead: reaching one
+ * through a bound instance would suggest a parser can read the binding, and it
+ * cannot.
+ */
+export type BoundProtocolRef<T> = {
+  [K in keyof T as T[K] extends (...args: infer _Args) => infer Result
+    ? Result extends ReceiptResult<JsonSafeValue>
+      ? never
+      : K
+    : never]: T[K] extends (params: infer Params, ...args: infer _Rest) => infer Result
+    ? Awaited<Result> extends CapabilityResult
+      ? (params: Params) => Promise<CapabilityNode>
+      : (params: Params) => Promise<Awaited<Result>>
+    : never;
+};
+
+/**
+ * Registry-resolved pure Receipt parsers of one Protocol, carrying no Runtime,
+ * account, Handles or binding. A caller parser delegates a Change interval
+ * through this surface and embeds the returned Receipt unchanged.
+ */
+export type ReceiptRef<T> = {
+  [K in keyof T as T[K] extends (changes: readonly Change[]) => ReceiptResult<JsonSafeValue>
+    ? K
+    : never]: T[K] extends (changes: readonly Change[]) => ReceiptResult<infer Outcome>
+    ? (changes: readonly Change[]) => Receipt<Outcome>
     : never;
 };
 

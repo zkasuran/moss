@@ -231,6 +231,11 @@ export function flattenCapabilityTree(root: CapabilityNode): ExecutableCapabilit
     ancestors.add(node);
     requireText(node.protocol, `${path}.protocol`);
     requireText(node.method, `${path}.method`);
+    // Binding is agent-supplied like params and travels the same wire, so it
+    // draws on the same cumulative budgets rather than a private allowance.
+    if (node.binding !== undefined) {
+      assertBoundedParams(node.binding, `${path}.binding`, budget);
+    }
     assertBoundedParams(node.params, `${path}.params`, budget);
     if (!Array.isArray(node.children)) throw new Error(`${path}.children must be an array`);
     if (node.children.length > CAPABILITY_TREE_LIMITS.maxChildrenPerCapability) {

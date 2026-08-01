@@ -1,13 +1,19 @@
 export {
+  type AnyProtocolFactory,
+  type BindingSchema,
+  bindingSchema,
   Capability,
   type CapabilitySpec,
   type ContractConfig,
+  type InferBinding,
   Protocol,
   type ProtocolConfig,
   type ProtocolCtor,
+  type ProtocolFactory,
   Query,
   type QuerySpec,
   Receipt,
+  type ReceiptNames,
 } from "./decorators.js";
 export {
   CAPABILITY_TREE_LIMITS,
@@ -42,12 +48,14 @@ export {
   ParameterError,
   type ParamsSpec,
   PositiveDecimalString,
+  parseBinding,
   parseParams,
   TokenReference,
   UnsignedIntegerString,
 } from "./semantics.js";
 export {
   type Address as AddressValue,
+  type BoundProtocolRef,
   CATEGORIES,
   type CapabilityNode,
   type CapabilityResult,
@@ -58,6 +66,7 @@ export {
   NATIVE,
   type ProtocolRef,
   type ReceiptChange,
+  type ReceiptRef,
   type ReceiptResult,
   type RegistryOptions,
   RISK_LABELS,

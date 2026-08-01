@@ -68,6 +68,58 @@ Protocol dependencies are explicit. Registry recursively registers them and inje
 
 `labels` names fixed Package addresses independently of Handles. Registry renders the example above as `Package(Myprotocol:Router)`, validates the combined payload inside the Core-owned wrapper as a safe 1–32 character name, and exposes it through declared dependency and Receipt parser caller scopes. Receipt parsers still emit raw evidence-backed addresses; Registry owns presentation.
 
+### Parameterized Protocols
+
+When a Protocol's contract identity is dynamic, declare it once as a binding instead of repeating it in every method's params. The schema pairs parameter declarations with a synchronous derivation of that instance's contract configs, and the binding type follows from the schema:
+
+```ts
+const vaultBinding = bindingSchema({
+  params: {
+    vault: { type: Address, description: "Vault contract this instance uses." },
+  },
+  contracts: ({ vault }) => ({ vault: { abi: VaultAbi, addr: vault } }),
+});
+
+@Protocol({
+  name: "myvault",
+  category: "token",
+  description: "One sentence an Agent can use to choose this Protocol.",
+  contracts: {},
+  binding: vaultBinding,
+})
+export class MyVault {
+  declare vault: Handle<typeof VaultAbi>;
+}
+
+export type MyVaultFactory = ProtocolFactory<MyVault, typeof vaultBinding, "depositReceipt">;
+```
+
+Binding validation is synchronous and reads nothing external, so a malformed binding fails before any Protocol method runs and before any RPC. Export the factory alias for consumers: it names your Protocol, its binding schema and the Receipt parsers you publish. A parser you leave out is not on the surface, and a Capability or Query is never on it.
+
+A Protocol that declares a parameterized dependency receives that factory:
+
+```ts
+@Protocol({
+  name: "myrouter",
+  category: "dex",
+  description: "One sentence an Agent can use to choose this Protocol.",
+  contracts: {},
+  protocols: { vaults: MyVault },
+})
+export class MyRouter {
+  declare vaults: MyVaultFactory;
+
+  // In a Capability: create as many independent instances as the operation needs.
+  //   const first = this.vaults.create({ vault: params.first });
+  //   const nested = await first.deposit({ amount: params.amount });
+  //
+  // In a Receipt parser: delegate through the binding-free parsers.
+  //   this.vaults.receipts.depositReceipt(changes)
+}
+```
+
+`create` is uncached, so two calls carrying the same address are two execution-scoped instances that cannot share state. Registry serializes the canonical binding onto each parameterized CapabilityNode and `load` describes it beside, and separately from, the method's params. Receipt parsing never receives or trusts that binding.
+
 ## 3. Define parameter contracts
 
 Each field pairs a reusable Zod value contract with a description of that field's role.
